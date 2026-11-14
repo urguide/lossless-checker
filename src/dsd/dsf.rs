@@ -5,34 +5,36 @@
 //! (`[ch0 block][ch1 block]…`), not byte-interleaved.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use crate::dsd::{BitOrder, BlockGroup, DsdContainer, DsdError, DsdMeta, DsdStream};
-
-/// Sentinel meaning "data chunk size was implausible; read until physical EOF instead".
-const UNKNOWN_REMAINING: u64 = u64::MAX;
 
 pub struct DsfReader {
     reader: BufReader<File>,
     meta: DsdMeta,
     block_size: usize,
     channels: usize,
-    /// Bytes of sample payload still to read, or `UNKNOWN_REMAINING`.
+    /// Bytes of sample payload still to read.
     remaining: u64,
+    samples_remaining: u64,
     buf: Vec<u8>,
 }
 
 impl DsfReader {
     pub fn open(path: &Path) -> Result<Self, DsdError> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let file = crate::safety::open_input(path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
 
         // --- DSD chunk (28 bytes) ---
         expect_magic(&mut reader, b"DSD ")?;
         let dsd_size = read_u64(&mut reader)?;
-        let _total_file_size = read_u64(&mut reader)?;
-        let _metadata_ptr = read_u64(&mut reader)?;
-        skip(&mut reader, dsd_size.saturating_sub(28))?;
+        let total_file_size = read_u64(&mut reader)?;
+        let metadata_ptr = read_u64(&mut reader)?;
+        if dsd_size != 28 || (total_file_size != 0 && total_file_size != file_len) {
+            return Err(DsdError::Invalid("invalid DSF header size".into()));
+        }
 
         // --- fmt chunk (52 bytes) ---
         expect_magic(&mut reader, b"fmt ")?;
@@ -46,7 +48,9 @@ impl DsfReader {
         let sample_count = read_u64(&mut reader)?;
         let block_size = read_u32(&mut reader)?;
         let _reserved = read_u32(&mut reader)?;
-        skip(&mut reader, fmt_size.saturating_sub(52))?;
+        if fmt_size != 52 {
+            return Err(DsdError::Invalid("invalid DSF fmt size".into()));
+        }
 
         if format_id != 0 {
             return Err(DsdError::Unsupported(format!(
@@ -58,23 +62,41 @@ impl DsfReader {
                 "bits per sample = {bits_per_sample} (expected 1)"
             )));
         }
-        if channel_num == 0 || block_size == 0 {
-            return Err(DsdError::Unsupported(
-                "zero channels or zero block size".to_string(),
-            ));
+        crate::dsd::validate_meta(channel_num as usize, sampling_freq as u64)?;
+        if block_size != 4096 {
+            return Err(DsdError::Invalid("DSF block size must be 4096".into()));
         }
 
         // --- data chunk header (12 bytes) ---
         expect_magic(&mut reader, b"data")?;
         let data_size = read_u64(&mut reader)?;
-        let remaining = if data_size >= 12 {
-            data_size - 12
-        } else {
-            UNKNOWN_REMAINING
-        };
+        let remaining = data_size
+            .checked_sub(12)
+            .ok_or_else(|| DsdError::Invalid("invalid DSF data size".into()))?;
+        let data_end = reader
+            .stream_position()?
+            .checked_add(remaining)
+            .ok_or_else(|| DsdError::Invalid("DSF size overflow".into()))?;
+        if data_end > file_len
+            || (metadata_ptr != 0 && (metadata_ptr < data_end || metadata_ptr >= file_len))
+        {
+            return Err(DsdError::Truncated);
+        }
 
         let channels = channel_num as usize;
-        let group_bytes = channels * block_size as usize;
+        let group_bytes = channels
+            .checked_mul(block_size as usize)
+            .ok_or_else(|| DsdError::Invalid("DSF group size overflow".into()))?;
+        let expected = sample_count
+            .div_ceil(8)
+            .div_ceil(block_size as u64)
+            .checked_mul(group_bytes as u64)
+            .ok_or_else(|| DsdError::Invalid("DSF sample count overflow".into()))?;
+        if remaining != expected {
+            return Err(DsdError::Invalid(
+                "DSF sample count does not match data size".into(),
+            ));
+        }
 
         Ok(Self {
             reader,
@@ -88,6 +110,7 @@ impl DsfReader {
             block_size: block_size as usize,
             channels,
             remaining,
+            samples_remaining: sample_count,
             buf: vec![0u8; group_bytes],
         })
     }
@@ -100,22 +123,16 @@ impl DsdStream for DsfReader {
 
     fn next_block_group(&mut self) -> Result<Option<BlockGroup>, DsdError> {
         let group_bytes = self.buf.len();
-        let want = if self.remaining == UNKNOWN_REMAINING {
-            group_bytes
-        } else {
-            self.remaining.min(group_bytes as u64) as usize
-        };
+        let want = self.remaining.min(group_bytes as u64) as usize;
         if want == 0 {
             return Ok(None);
         }
 
         let n = read_up_to(&mut self.reader, &mut self.buf[..want])?;
-        if n == 0 {
-            return Ok(None);
+        if n != want {
+            return Err(DsdError::Truncated);
         }
-        if self.remaining != UNKNOWN_REMAINING {
-            self.remaining -= n as u64;
-        }
+        self.remaining -= n as u64;
 
         // Split the group into per-channel whole blocks. The last group may be short; tail
         // channels then receive fewer (or zero) bytes, which is harmless for the spectrum.
@@ -123,8 +140,13 @@ impl DsdStream for DsfReader {
         for c in 0..self.channels {
             let start = (c * self.block_size).min(n);
             let end = ((c + 1) * self.block_size).min(n);
-            channels.push(self.buf[start..end].to_vec());
+            // Ignore whole padding bytes; at most seven padding bits remain in the final byte.
+            let usable = self.samples_remaining.div_ceil(8).min((end - start) as u64) as usize;
+            channels.push(self.buf[start..start + usable].to_vec());
         }
+        self.samples_remaining = self
+            .samples_remaining
+            .saturating_sub(self.block_size as u64 * 8);
         Ok(Some(BlockGroup { channels }))
     }
 }
@@ -173,21 +195,6 @@ fn read_exact<R: Read>(r: &mut R, buf: &mut [u8]) -> Result<(), DsdError> {
         Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Err(DsdError::Truncated),
         Err(e) => Err(DsdError::Io(e)),
     }
-}
-
-/// Skip `n` bytes by reading and discarding (BufReader-friendly for the small inter-chunk gaps).
-fn skip<R: Read>(r: &mut R, n: u64) -> Result<(), DsdError> {
-    if n == 0 {
-        return Ok(());
-    }
-    let mut left = n;
-    let mut scratch = [0u8; 512];
-    while left > 0 {
-        let want = left.min(scratch.len() as u64) as usize;
-        read_exact(r, &mut scratch[..want])?;
-        left -= want as u64;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -240,7 +247,7 @@ mod tests {
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("lc_dsf_test_{}_{id}.dsf", std::process::id()));
-        let mut f = File::create(&p).unwrap();
+        let mut f = crate::safety::create_output(&p).unwrap();
         f.write_all(bytes).unwrap();
         p
     }
@@ -278,7 +285,10 @@ mod tests {
         let mut bytes = synth_dsf(2, 2_822_400, 4096, 1, 0);
         bytes[0] = b'X';
         let p = write_temp(&bytes);
-        assert!(matches!(DsfReader::open(&p), Err(DsdError::BadMagic { .. })));
+        assert!(matches!(
+            DsfReader::open(&p),
+            Err(DsdError::BadMagic { .. })
+        ));
         let _ = std::fs::remove_file(&p);
     }
 

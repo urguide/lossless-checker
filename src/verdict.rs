@@ -45,16 +45,16 @@ impl Verdict {
     pub fn sentence(self, lang: Lang) -> &'static str {
         match self {
             Verdict::Clean => lang.pick(
-                "✅ 高频延伸正常，像真无损",
-                "✅ High frequencies extend naturally — looks like genuine lossless",
+                "✅ 未发现明显有损转码迹象（不代表无损来源证明）",
+                "✅ No obvious lossy-transcode evidence detected — not proof of lossless provenance",
             ),
             Verdict::Narrowed => lang.pick(
-                "⚠️  高频有收窄（截止约 16.5-19kHz），可能是高码率有损转码，建议人工复核频谱",
-                "⚠️  High frequencies are narrowed (cutoff ~16.5-19kHz) — possibly a high-bitrate lossy transcode; review the spectrum manually",
+                "⚠️  高频有收窄（截止约 16.8-19kHz），可能是高码率有损转码，建议人工复核频谱",
+                "⚠️  High frequencies are narrowed (cutoff ~16.8-19kHz) — possibly a high-bitrate lossy transcode; review the spectrum manually",
             ),
             Verdict::Suspect => lang.pick(
-                "🚩 高频明显截断（截止 < 16.5kHz），高度疑似假无损（有损转码）",
-                "🚩 High frequencies are clearly cut (cutoff < 16.5kHz) — highly likely fake lossless (lossy transcode)",
+                "🚩 高频明显截断（截止 < 16.8kHz），疑似有损来源，需人工复核",
+                "🚩 High frequencies are cut below 16.8kHz — suspect lossy source; review manually",
             ),
             Verdict::Upsampled => lang.pick(
                 "🔼 声称为 Hi-Res，但真实内容止于 ~CD 频段，疑似上采样/有损转制的假 Hi-Res",
@@ -82,8 +82,7 @@ pub struct Analysis {
 /// thresholds on the audible band. Holes are intentionally NOT consulted here (report-only).
 pub fn classify(f: &SpectralFeatures, sample_rate: u32) -> Verdict {
     if sample_rate > 48_000 {
-        // `map_or(true, …)` instead of `is_none_or` so the crate builds on Rust < 1.82.
-        let empty = f.hires_ext_db.map_or(true, |db| db < HIRES_EMPTY_DB);
+        let empty = f.hires_ext_db.is_none_or(|db| db < HIRES_EMPTY_DB);
         if f.cutoff_hz < HIRES_MIN_EXT || empty {
             return Verdict::Upsampled;
         }

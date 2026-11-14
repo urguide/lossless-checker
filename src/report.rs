@@ -66,7 +66,9 @@ pub fn build_text_report(root: &Path, outcomes: &[Outcome], lang: Lang) -> Strin
                 }
                 if is_flagged(a.verdict) {
                     flagged.push((a.cutoff_hz, a.verdict, &o.path));
-                    let slot = albums.entry(album_of(root, &o.path, lang)).or_insert([0, 0]);
+                    let slot = albums
+                        .entry(album_of(root, &o.path, lang))
+                        .or_insert([0, 0]);
                     match a.verdict {
                         Verdict::Narrowed => slot[1] += 1,
                         _ => slot[0] += 1, // suspect + upsampled
@@ -86,20 +88,80 @@ pub fn build_text_report(root: &Path, outcomes: &[Outcome], lang: Lang) -> Strin
     });
 
     let mut album_rank: Vec<(&String, &[usize; 2])> = albums.iter().collect();
-    album_rank.sort_by(|a, b| b.1[0].cmp(&a.1[0]).then(b.1[1].cmp(&a.1[1])).then(a.0.cmp(b.0)));
+    album_rank.sort_by(|a, b| {
+        b.1[0]
+            .cmp(&a.1[0])
+            .then(b.1[1].cmp(&a.1[1]))
+            .then(a.0.cmp(b.0))
+    });
 
     let mut s = String::new();
-    let _ = writeln!(s, "{}", lang.pick("假无损批量扫描报告", "Fake-lossless batch scan report"));
-    let _ = writeln!(s, "{}: {}", lang.pick("生成时间", "Generated"), now_string());
-    let _ = writeln!(s, "{}: {}", lang.pick("扫描根目录", "Scan root"), root.display());
-    let _ = writeln!(s, "{}: {}", lang.pick("文件总数", "Total files"), outcomes.len());
+    let _ = writeln!(
+        s,
+        "{}",
+        lang.pick("假无损批量扫描报告", "Fake-lossless batch scan report")
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("生成时间", "Generated"),
+        now_string()
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("扫描根目录", "Scan root"),
+        crate::safety::display(root)
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("文件总数", "Total files"),
+        outcomes.len()
+    );
     let _ = writeln!(s);
     let _ = writeln!(s, "== {} ==", lang.pick("汇总", "Summary"));
-    let _ = writeln!(s, "  {}  {clean}", lang.pick("✅ 像真无损 (≥19kHz)        ", "✅ Likely lossless (≥19kHz)    "));
-    let _ = writeln!(s, "  {}  {narrowed}", lang.pick("⚠️  高频收窄 (16.5-19kHz)    ", "⚠️  Narrowed HF (16.5-19kHz)    "));
-    let _ = writeln!(s, "  {}  {suspect}", lang.pick("🚩 高度可疑 (<16.5kHz)      ", "🚩 Highly suspect (<16.5kHz)   "));
-    let _ = writeln!(s, "  {}  {upsampled}", lang.pick("🔼 假 Hi-Res (上采样)        ", "🔼 Fake Hi-Res (upsampled)     "));
-    let _ = writeln!(s, "  {}  {}", lang.pick("✖  解码失败                 ", "✖  Decode failed               "), errors.len());
+    let _ = writeln!(
+        s,
+        "  {}  {clean}",
+        lang.pick(
+            "✅ 像真无损 (≥19kHz)        ",
+            "✅ Likely lossless (≥19kHz)    "
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {}  {narrowed}",
+        lang.pick(
+            "⚠️  高频收窄 (16.8-19kHz)    ",
+            "⚠️  Narrowed HF (16.8-19kHz)    "
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {}  {suspect}",
+        lang.pick(
+            "🚩 高度可疑 (<16.8kHz)      ",
+            "🚩 Highly suspect (<16.8kHz)   "
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {}  {upsampled}",
+        lang.pick(
+            "🔼 假 Hi-Res (上采样)        ",
+            "🔼 Fake Hi-Res (upsampled)     "
+        )
+    );
+    let _ = writeln!(
+        s,
+        "  {}  {}",
+        lang.pick(
+            "✖  解码失败                 ",
+            "✖  Decode failed               "
+        ),
+        errors.len()
+    );
     let _ = writeln!(s);
     let _ = writeln!(
         s,
@@ -119,16 +181,40 @@ pub fn build_text_report(root: &Path, outcomes: &[Outcome], lang: Lang) -> Strin
     );
 
     let _ = writeln!(s);
-    let _ = writeln!(s, "== {} ==", lang.pick("按专辑排行（🚩/🔼 数量降序）", "Albums ranked (by 🚩/🔼 count, descending)"));
+    let _ = writeln!(
+        s,
+        "== {} ==",
+        lang.pick(
+            "按专辑排行（🚩/🔼 数量降序）",
+            "Albums ranked (by 🚩/🔼 count, descending)"
+        )
+    );
     if album_rank.iter().all(|(_, c)| c[0] == 0) {
-        let _ = writeln!(s, "  {}", lang.pick("（无 🚩/🔼 文件）", "(no 🚩/🔼 files)"));
+        let _ = writeln!(
+            s,
+            "  {}",
+            lang.pick("（无 🚩/🔼 文件）", "(no 🚩/🔼 files)")
+        );
     }
     for (name, c) in album_rank.iter().filter(|(_, c)| c[0] > 0) {
-        let _ = writeln!(s, "  🚩/🔼{:>3}  ⚠️{:>3}  {}", c[0], c[1], name);
+        let _ = writeln!(
+            s,
+            "  🚩/🔼{:>3}  ⚠️{:>3}  {}",
+            c[0],
+            c[1],
+            crate::safety::escape(name)
+        );
     }
 
     let _ = writeln!(s);
-    let _ = writeln!(s, "== {} ==", lang.pick("可疑文件清单（🚩/🔼 在前，各按截止频率升序）", "Flagged files (🚩/🔼 first, each by cutoff ascending)"));
+    let _ = writeln!(
+        s,
+        "== {} ==",
+        lang.pick(
+            "可疑文件清单（🚩/🔼 在前，各按截止频率升序）",
+            "Flagged files (🚩/🔼 first, each by cutoff ascending)"
+        )
+    );
     if flagged.is_empty() {
         let _ = writeln!(s, "  {}", lang.pick("（无）", "(none)"));
     }
@@ -138,15 +224,27 @@ pub fn build_text_report(root: &Path, outcomes: &[Outcome], lang: Lang) -> Strin
             "  {:>6.0} Hz  {}  {}",
             cutoff,
             verdict.icon(),
-            rel_display(root, path)
+            crate::safety::escape(&rel_display(root, path))
         );
     }
 
     if !errors.is_empty() {
         let _ = writeln!(s);
-        let _ = writeln!(s, "== {} ==", lang.pick("解码失败（未参与判定，需人工检查）", "Decode failures (not classified; check manually)"));
+        let _ = writeln!(
+            s,
+            "== {} ==",
+            lang.pick(
+                "解码失败（未参与判定，需人工检查）",
+                "Decode failures (not classified; check manually)"
+            )
+        );
         for (path, err) in &errors {
-            let _ = writeln!(s, "  ✖  {}  — {}", rel_display(root, path), err);
+            let _ = writeln!(
+                s,
+                "  ✖  {}  — {}",
+                crate::safety::escape(&rel_display(root, path)),
+                crate::safety::escape(err)
+            );
         }
     }
 
@@ -250,13 +348,10 @@ pub fn build_json(root: &Path, outcomes: &[Outcome]) -> ReportJson {
     }
 }
 
-/// Local timestamp via the `date` command; empty string if it isn't available.
+/// UTC Unix timestamp, without executing an external program.
 pub(crate) fn now_string() -> String {
-    std::process::Command::new("date")
-        .arg("+%Y-%m-%d %H:%M:%S")
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default()
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("{} (Unix seconds, UTC)", d.as_secs()),
+        Err(_) => "unknown".into(),
+    }
 }

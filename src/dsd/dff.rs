@@ -6,7 +6,7 @@
 //! DSF's whole-block separation. Each IFF chunk's data is padded to an even byte boundary.
 
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::{BufReader, Read, Seek};
 use std::path::Path;
 
 use crate::dsd::{BitOrder, BlockGroup, DsdContainer, DsdError, DsdMeta, DsdStream};
@@ -27,11 +27,17 @@ pub struct DffReader {
 
 impl DffReader {
     pub fn open(path: &Path) -> Result<Self, DsdError> {
-        let mut reader = BufReader::new(File::open(path)?);
+        let file = crate::safety::open_input(path)?;
+        let file_len = file.metadata()?.len();
+        let mut reader = BufReader::new(file);
 
         // --- FRM8 form header ---
         expect_id(&mut reader, b"FRM8")?;
-        let _form_size = read_u64(&mut reader)?;
+        let form_size = read_u64(&mut reader)?;
+        let form_end = form_size
+            .checked_add(12)
+            .filter(|end| *end <= file_len && form_size >= 4)
+            .ok_or(DsdError::Truncated)?;
         let mut form_type = [0u8; 4];
         read_exact(&mut reader, &mut form_type)?;
         if &form_type != b"DSD " {
@@ -43,8 +49,20 @@ impl DffReader {
         let mut data_size: Option<u64> = None;
 
         // --- walk top-level chunks until the sound-data chunk (or clean EOF) ---
-        while let Some(id) = read_id_opt(&mut reader)? {
+        while reader.stream_position()? < form_end {
+            if form_end - reader.stream_position()? < 12 {
+                return Err(DsdError::Truncated);
+            }
+            let id = read_id_opt(&mut reader)?.ok_or(DsdError::Truncated)?;
             let size = read_u64(&mut reader)?;
+            let end = reader
+                .stream_position()?
+                .checked_add(size)
+                .and_then(|n| n.checked_add(size % 2))
+                .ok_or_else(|| DsdError::Invalid("DFF chunk size overflow".into()))?;
+            if end > form_end {
+                return Err(DsdError::Truncated);
+            }
             match &id {
                 b"PROP" => {
                     let (sr, ch) = parse_prop(&mut reader, size)?;
@@ -61,8 +79,7 @@ impl DffReader {
                     return Err(DsdError::Unsupported("DST-compressed DSD".to_string()));
                 }
                 _ => {
-                    skip(&mut reader, size)?;
-                    skip_pad(&mut reader, size)?;
+                    reader.seek(std::io::SeekFrom::Start(end))?;
                 }
             }
         }
@@ -75,12 +92,17 @@ impl DffReader {
         let remaining = data_size
             .ok_or_else(|| DsdError::Unsupported("DFF has no DSD sound-data chunk".to_string()))?;
 
-        if channels == 0 {
-            return Err(DsdError::Unsupported("zero channels".to_string()));
+        crate::dsd::validate_meta(channels, sample_rate as u64)?;
+        if remaining % channels as u64 != 0 {
+            return Err(DsdError::Invalid("incomplete DFF channel frame".into()));
         }
 
         let group_bytes = (READ_TARGET / channels).max(1) * channels;
-        let total_samples_per_channel = Some(remaining / channels as u64 * 8);
+        let total_samples_per_channel = Some(
+            (remaining / channels as u64)
+                .checked_mul(8)
+                .ok_or_else(|| DsdError::Invalid("DFF sample count overflow".into()))?,
+        );
 
         Ok(Self {
             reader,
@@ -110,8 +132,8 @@ impl DsdStream for DffReader {
             return Ok(None);
         }
         let n = read_up_to(&mut self.reader, &mut self.buf[..want])?;
-        if n == 0 {
-            return Ok(None);
+        if n != want {
+            return Err(DsdError::Truncated);
         }
         self.remaining -= n as u64;
 
@@ -128,10 +150,15 @@ impl DsdStream for DffReader {
 
 /// Parse a PROP chunk (read its `size` bytes whole — PROP is small) for FS and CHNL.
 fn parse_prop<R: Read>(r: &mut R, size: u64) -> Result<(Option<u32>, Option<u16>), DsdError> {
+    if !(4..=1_048_576).contains(&size) {
+        return Err(DsdError::Invalid("DFF PROP must be at most 1 MiB".into()));
+    }
     let mut body = vec![0u8; size as usize];
     read_exact(r, &mut body)?;
     if body.len() < 4 || &body[..4] != b"SND " {
-        return Err(DsdError::Unsupported("DFF PROP is not a sound property chunk".to_string()));
+        return Err(DsdError::Unsupported(
+            "DFF PROP is not a sound property chunk".to_string(),
+        ));
     }
 
     let mut sample_rate = None;
@@ -139,9 +166,15 @@ fn parse_prop<R: Read>(r: &mut R, size: u64) -> Result<(Option<u32>, Option<u16>
     let mut pos = 4;
     while pos + 12 <= body.len() {
         let id = &body[pos..pos + 4];
-        let sz = u64::from_be_bytes(body[pos + 4..pos + 12].try_into().unwrap()) as usize;
+        let sz = usize::try_from(u64::from_be_bytes(
+            body[pos + 4..pos + 12].try_into().unwrap(),
+        ))
+        .map_err(|_| DsdError::Invalid("DFF subchunk too large".into()))?;
         pos += 12;
-        let end = (pos + sz).min(body.len());
+        let end = pos
+            .checked_add(sz)
+            .filter(|end| *end <= body.len())
+            .ok_or(DsdError::Truncated)?;
         let data = &body[pos..end];
         match id {
             b"FS  " if data.len() >= 4 => {
@@ -155,10 +188,13 @@ fn parse_prop<R: Read>(r: &mut R, size: u64) -> Result<(Option<u32>, Option<u16>
             }
             _ => {}
         }
-        pos += sz;
-        if sz % 2 == 1 {
-            pos += 1; // chunk data is padded to an even length
-        }
+        pos = end
+            .checked_add(sz % 2)
+            .filter(|end| *end <= body.len())
+            .ok_or(DsdError::Truncated)?;
+    }
+    if pos != body.len() {
+        return Err(DsdError::Truncated);
     }
     Ok((sample_rate, channels))
 }
@@ -308,7 +344,10 @@ mod tests {
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("lc_dff_test_{}_{id}.dff", std::process::id()));
-        File::create(&p).unwrap().write_all(bytes).unwrap();
+        crate::safety::create_output(&p)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
         p
     }
 
@@ -354,7 +393,10 @@ mod tests {
         let mut bytes = synth_dff(2_822_400, b"DSD ", 10);
         bytes[0] = b'X'; // corrupt FRM8
         let p = write_temp(&bytes);
-        assert!(matches!(DffReader::open(&p), Err(DsdError::BadMagic { .. })));
+        assert!(matches!(
+            DffReader::open(&p),
+            Err(DsdError::BadMagic { .. })
+        ));
         let _ = std::fs::remove_file(&p);
     }
 }

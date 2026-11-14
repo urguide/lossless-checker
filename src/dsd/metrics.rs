@@ -152,15 +152,26 @@ fn mean_power_band(ps: &PowerSpectrum, lo: f64, hi: f64) -> f64 {
 /// below-band stays within `floor_db` of the baseband peak — and (b) the power drops by at least
 /// `step_db` across it. A gentle analog roll-off has no such sharp step, so it is not flagged.
 pub fn detect_cd_wall(ps: &PowerSpectrum, cd_hz: f64, step_db: f64, floor_db: f64) -> bool {
-    let below = mean_power_band(ps, cd_hz - CD_WALL_GAP_HZ - CD_WALL_SPAN_HZ, cd_hz - CD_WALL_GAP_HZ);
-    let above = mean_power_band(ps, cd_hz + CD_WALL_GAP_HZ, cd_hz + CD_WALL_GAP_HZ + CD_WALL_SPAN_HZ);
+    let below = mean_power_band(
+        ps,
+        cd_hz - CD_WALL_GAP_HZ - CD_WALL_SPAN_HZ,
+        cd_hz - CD_WALL_GAP_HZ,
+    );
+    let above = mean_power_band(
+        ps,
+        cd_hz + CD_WALL_GAP_HZ,
+        cd_hz + CD_WALL_GAP_HZ + CD_WALL_SPAN_HZ,
+    );
     if below <= 0.0 || above <= 0.0 {
         return false;
     }
 
     // Music must actually reach the wall — otherwise a quiet region's noise-vs-noise step is
     // meaningless (e.g. a track that already rolled off at 15 kHz).
-    let peak = ps.power[..ps.bin_at(cd_hz).max(1)].iter().cloned().fold(0.0f64, f64::max);
+    let peak = ps.power[..ps.bin_at(cd_hz).max(1)]
+        .iter()
+        .cloned()
+        .fold(0.0f64, f64::max);
     if peak <= 0.0 || below < peak * 10f64.powf(-floor_db / 10.0) {
         return false;
     }

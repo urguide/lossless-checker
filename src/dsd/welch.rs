@@ -32,7 +32,11 @@ impl WelchPlan {
         // Blackman-Harris (reused from the PCM side): ~-92 dB sidelobes keep strong baseband
         // energy from leaking up and corrupting the noise-shaping slope fit at 30–100 kHz.
         let window = blackman_harris(fft_size);
-        Self { fft, window, fft_size }
+        Self {
+            fft,
+            window,
+            fft_size,
+        }
     }
 
     pub fn fft_size(&self) -> usize {
@@ -48,7 +52,9 @@ impl WelchPlan {
     /// (measured ~5× more CPU for the same work). Pass the full pool size only when one file has the
     /// machine to itself.
     pub fn worker_pool(&self, threads: usize) -> Vec<FrameWorker<'_>> {
-        (0..threads.max(1)).map(|_| FrameWorker::new(self)).collect()
+        (0..threads.max(1))
+            .map(|_| FrameWorker::new(self))
+            .collect()
     }
 
     /// Sum `|FFT(frame · window)|²` over every whole `fft_size` frame in `samples`, **adding** the
@@ -127,14 +133,22 @@ impl<'a> FrameWorker<'a> {
     }
 
     fn accumulate(&mut self, frame: &[f32]) {
-        for (dst, (&s, &w)) in self.input.iter_mut().zip(frame.iter().zip(&self.plan.window)) {
+        for (dst, (&s, &w)) in self
+            .input
+            .iter_mut()
+            .zip(frame.iter().zip(&self.plan.window))
+        {
             *dst = s * w;
         }
         self.plan
             .fft
             .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch)
             .expect("FFT input/output sizes match");
-        for (a, c) in self.sum.iter_mut().zip(self.output.iter().take(self.plan.fft_size / 2)) {
+        for (a, c) in self
+            .sum
+            .iter_mut()
+            .zip(self.output.iter().take(self.plan.fft_size / 2))
+        {
             *a += c.norm_sqr() as f64;
         }
         self.count += 1;

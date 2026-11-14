@@ -7,7 +7,7 @@ A heuristic detector for **fake lossless** audio — files transcoded from a los
 CD/lossy material upsampled into a 96/192 kHz container. Point it at one file for a verdict, or at a
 whole library for a ranked report of the suspects.
 
-- **Read-only** — it analyzes and reports; it never moves, renames, or deletes anything.
+- **Input-preserving** — audio is opened read-only; report/CSV outputs are exclusively created and never overwrite existing files or symlink targets.
 - **Pure-Rust, zero system dependencies** — FLAC/ALAC/WAV/AIFF/CAF via symphonia; DSD
   (`.dsf`/`.dff`) via the native [`check-dsd`](#dsd-authenticity-check-dsd) subcommand.
 - **Hi-Res aware** — detects upsampling, empty high-frequency bands, and spectral holes.
@@ -76,11 +76,8 @@ cd lossless-checker-*/
 ./lossless-checker check "path/to/song.flac"
 ```
 
-On macOS, Gatekeeper quarantines binaries downloaded from the web. If you see *"cannot be opened because the developer cannot be verified"*, clear the quarantine flag once:
-
-```bash
-xattr -d com.apple.quarantine ./lossless-checker
-```
+On macOS, verify the release provenance and checksum before trusting a download. If Gatekeeper
+cannot verify the developer, building locally from reviewed source is an alternative.
 
 To run it from anywhere, move it onto your `PATH`, e.g. `sudo mv lossless-checker /usr/local/bin/`.
 
@@ -92,18 +89,45 @@ Unzip the archive and run `lossless-checker.exe` from PowerShell or `cmd`:
 .\lossless-checker.exe check "path\to\song.flac"
 ```
 
-If SmartScreen warns about an unrecognized app, choose **More info → Run anyway**.
+If SmartScreen cannot verify the app, verify its source and provenance or build locally.
 
-> The `<ver>` placeholder matches the release tag, e.g. `v0.1.0`. In the [Usage](#usage) examples below, substitute the binary path (`./lossless-checker`) wherever a command shows `cargo run --release --`.
+> New packages use the first 12 characters of the source commit as `<ver>` (older releases used tags).
+> In the examples below, substitute `./lossless-checker` for `cargo run --release --` when using a binary.
 
 ## Build
 
-To build from source instead (requires a [Rust toolchain](https://rustup.rs/)):
+To build from source instead (requires [Rust](https://rustup.rs/) 1.100 or newer):
 
 ```bash
-cargo build --release
+cargo build --locked --release
 # binary at ./target/release/lossless-checker
 ```
+
+## Automated builds and safety behavior
+
+Every branch push and pull request runs formatting, Clippy, unit tests, generated security
+regressions and an OSV check of all locked dependencies. Successful runs build Linux GNU/musl,
+macOS Intel/Apple Silicon and Windows x64 packages. Download archives and SHA-256 files from
+**Actions → Test, build and package → Artifacts** (retained for 14 days).
+Pushing a `v*` tag additionally publishes those packages as a GitHub Release with build provenance.
+Verify an archive with `gh attestation verify <archive> --repo <owner>/<repo>`; a checksum alone
+does not authenticate its publisher. Actions are pinned to commit SHAs and Rust to 1.100.0.
+
+- Outputs must be new paths; existing files, symlinks and hard links are rejected. Pick another
+  output filename for a repeated run.
+- Only regular, non-symlink input files are accepted. Directory traversal skips links and special
+  files, reports enumeration failures and limits a scan to one million entries.
+- PCM uses streaming per-channel power spectra, avoiding stereo phase cancellation and whole-track
+  memory growth. Supported analysis bounds: 1–8 channels, 38–768 kHz. Silence, insufficient samples,
+  non-finite samples and detected decode/truncation errors are reported as errors, not `clean`.
+  Symphonia uses EOF for stream termination: truncation detection relies on declared frame counts
+  and available codec integrity checks; this is not a universal file-integrity verifier.
+- DSD validates chunk boundaries, sample counts, channels (1–8), rates (1–50 MHz), DSF block size
+  (4096 bytes), and DFF PROP size (at most 1 MiB). FFT size must be a power of two from 1024 to 262144.
+- Workers default to `min(CPU cores, 4)`; `--jobs` accepts 1–32. Batch read/parse errors return a
+  nonzero exit status after reporting results. A suspicious verdict alone is not a process error.
+- These checks are not a sandbox for third-party decoders. Use OS resource limits/process isolation
+  when processing hostile uploads. `clean`/DSD `pass` means no detected evidence, never proof of origin.
 
 ## Usage
 
@@ -204,7 +228,7 @@ With `--json` you also get machine-readable output. Hi-Res files additionally ca
 | `--report`     | stdout                  | Write the text report to this file (directory scan only). |
 | `--json`       | —                       | Also write a JSON report to this file (directory scan only). |
 | `--ext`        | `flac,wav,m4a,aif,aiff,caf,alac` | Comma-separated extensions to scan. Lossless/PCM containers only — scanning mp3 etc. is pointless for fake-lossless detection, and DSD goes through `check-dsd`. |
-| `--jobs`       | CPU cores               | Number of parallel worker threads. |
+| `--jobs`       | min(CPU cores, 4)        | Number of parallel worker threads, 1–32. |
 | `--lang`       | `zh`                    | Output language for logs and reports: `zh` (中文, default) or `en`. The JSON report is unaffected. |
 
 ### Verdict tiers
@@ -250,10 +274,10 @@ cargo run --release -- check-dsd ~/DSD --album-summary --lang en
 `check-dsd` needs **no system dependencies**. It parses the `.dsf`/`.dff` container itself, pulls
 the raw 1-bit stream, and measures its full-band power spectrum up to the DSD Nyquist (~1.41 MHz for
 DSD64). That
-exposes the one fingerprint a transcoder can't cheaply fake: **noise shaping** — the Sigma-Delta
-quantization noise a genuine DSD master pushes up into 50–100 kHz (a strong positive slope). A
-PCM/lossy source converted to DSD lacks that rise and often still carries a CD/lossy cutoff in the
-baseband. The bitstream is processed streaming, so memory stays decoupled from file size.
+measures **noise shaping** — Sigma-Delta quantization noise pushed into ultrasonic bands.
+PCM converted through a Sigma-Delta modulator can have the same rise, so it cannot prove native
+DSD provenance. Baseband cutoffs provide additional, imperfect evidence. CD/PCM sourcing also
+does not by itself mean a lossy codec was used. The bitstream is processed streaming.
 
 Each file is judged **Pass** / **Suspicious** / **Unsupported** from three metrics: noise-shaping
 slope (dB/oct), ultrasonic energy ratio (>50 kHz), and baseband cutoff (≤24 kHz only, so a DXD

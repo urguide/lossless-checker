@@ -5,7 +5,8 @@
 //! energy lives well above the CD Nyquist — the empty-HF / fake-hi-res signal), and
 //! `detect_holes` (AAC/Vorbis-style notches below the cutoff; report-only).
 
-use realfft::RealFftPlanner;
+use realfft::{num_complex::Complex, RealFftPlanner, RealToComplex};
+use std::sync::Arc;
 
 /// FFT window size. Frequency resolution = sample_rate / FFT_SIZE (~5-6 Hz/bin @44.1k).
 const FFT_SIZE: usize = 8192;
@@ -47,32 +48,89 @@ pub struct SpectrumOpts {
     pub threshold_mult: f64,
 }
 
-/// Analyze mono PCM and extract the spectral features.
-pub fn analyze(samples: &[f32], sample_rate: u32, opts: SpectrumOpts) -> SpectralFeatures {
+/// Bounded, per-channel FFT accumulation. Average powers, never channel amplitudes.
+pub struct StreamingSpectrum {
+    fft: Arc<dyn RealToComplex<f32>>,
+    pending: Vec<Vec<f32>>,
+    window: Vec<f32>,
+    input: Vec<f32>,
+    output: Vec<Complex<f32>>,
+    scratch: Vec<Complex<f32>>,
+    energy: Vec<f64>,
+    windows: u64,
+}
+
+impl StreamingSpectrum {
+    pub fn new(channels: usize) -> Self {
+        let fft = RealFftPlanner::<f32>::new().plan_fft_forward(FFT_SIZE);
+        Self {
+            pending: (0..channels)
+                .map(|_| Vec::with_capacity(FFT_SIZE))
+                .collect(),
+            window: blackman_harris(FFT_SIZE),
+            input: fft.make_input_vec(),
+            output: fft.make_output_vec(),
+            scratch: fft.make_scratch_vec(),
+            energy: vec![0.0; FFT_SIZE / 2],
+            windows: 0,
+            fft,
+        }
+    }
+
+    pub fn push(&mut self, interleaved: &[f32]) -> Result<(), String> {
+        let channels = self.pending.len();
+        if channels == 0 || !interleaved.len().is_multiple_of(channels) {
+            return Err("invalid interleaved channel layout".into());
+        }
+        for frame in interleaved.chunks_exact(channels) {
+            for (c, &s) in frame.iter().enumerate() {
+                if !s.is_finite() || s.abs() > 16.0 {
+                    return Err("invalid or out-of-range PCM sample".into());
+                }
+                let pending = &mut self.pending[c];
+                pending.push(s);
+                if pending.len() == FFT_SIZE {
+                    for (dst, (&s, &w)) in
+                        self.input.iter_mut().zip(pending.iter().zip(&self.window))
+                    {
+                        *dst = s * w;
+                    }
+                    self.fft
+                        .process_with_scratch(&mut self.input, &mut self.output, &mut self.scratch)
+                        .map_err(|e| e.to_string())?;
+                    for (sum, v) in self.energy.iter_mut().zip(&self.output) {
+                        *sum += v.norm_sqr() as f64;
+                    }
+                    self.windows += 1;
+                    pending.clear();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<Vec<f64>, String> {
+        if self.windows == 0 {
+            return Err("inconclusive: fewer than 8192 samples per channel".into());
+        }
+        for v in &mut self.energy {
+            *v /= self.windows as f64;
+        }
+        if !self.energy.iter().any(|&v| v > 0.0) {
+            return Err("inconclusive: silence has no spectral evidence".into());
+        }
+        Ok(self.energy)
+    }
+}
+
+/// Extract features from the streamed mean power spectrum.
+pub fn analyze_energy(energy: &[f64], sample_rate: u32, opts: SpectrumOpts) -> SpectralFeatures {
     let nyquist = sample_rate as f32 / 2.0;
 
-    // Too short to analyze meaningfully — report full-band and no anomalies.
-    if samples.len() < FFT_SIZE {
-        return SpectralFeatures {
-            cutoff_hz: nyquist,
-            holes: Vec::new(),
-            hires_ext_db: None,
-        };
-    }
-
-    let (energy, window_count) = avg_power_spectrum(samples);
-    if window_count == 0 {
-        return SpectralFeatures {
-            cutoff_hz: nyquist,
-            holes: Vec::new(),
-            hires_ext_db: None,
-        };
-    }
-
     let bin_hz = nyquist / (FFT_SIZE as f32 / 2.0);
-    let smooth = smooth_spectrum(&energy);
+    let smooth = smooth_spectrum(energy);
 
-    let cutoff_hz = detect_cutoff(&energy, &smooth, bin_hz, nyquist, &opts);
+    let cutoff_hz = detect_cutoff(energy, &smooth, bin_hz, nyquist, &opts);
     let hires_ext_db = if sample_rate > 48_000 {
         hires_extension_db(&smooth, bin_hz, nyquist)
     } else {
@@ -93,6 +151,7 @@ pub fn analyze(samples: &[f32], sample_rate: u32, opts: SpectrumOpts) -> Spectra
 /// intro and only bring in high-frequency content — cymbals, percussion — later. Sampling
 /// just the intro underestimates the cutoff and produces false positives. Throughput comes
 /// from parallelism across files instead.
+#[cfg(test)]
 fn avg_power_spectrum(samples: &[f32]) -> (Vec<f64>, u64) {
     let mut planner = RealFftPlanner::<f32>::new();
     let fft = planner.plan_fft_forward(FFT_SIZE);
@@ -109,12 +168,15 @@ fn avg_power_spectrum(samples: &[f32]) -> (Vec<f64>, u64) {
     let hop = FFT_SIZE; // no overlap; good enough and fast
     let mut pos = 0;
     while pos + FFT_SIZE <= samples.len() {
-        for (dst, (&s, &w)) in input.iter_mut().zip(samples[pos..pos + FFT_SIZE].iter().zip(&window))
+        for (dst, (&s, &w)) in input
+            .iter_mut()
+            .zip(samples[pos..pos + FFT_SIZE].iter().zip(&window))
         {
             *dst = s * w;
         }
 
-        fft.process(&mut input, &mut spectrum).expect("FFT input/output sizes match");
+        fft.process(&mut input, &mut spectrum)
+            .expect("FFT input/output sizes match");
 
         for (i, c) in spectrum.iter().take(FFT_SIZE / 2).enumerate() {
             energy[i] += c.norm_sqr() as f64;
@@ -231,7 +293,10 @@ fn hires_extension_db(smooth: &[f64], bin_hz: f32, nyquist: f32) -> Option<f32> 
     if lo_bin >= hi_bin {
         return None;
     }
-    let band_max = smooth[lo_bin..hi_bin].iter().cloned().fold(0.0f64, f64::max);
+    let band_max = smooth[lo_bin..hi_bin]
+        .iter()
+        .cloned()
+        .fold(0.0f64, f64::max);
     if band_max <= 0.0 {
         return Some(-120.0);
     }
@@ -304,6 +369,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn streaming_is_independent_of_packet_boundaries() {
+        let samples: Vec<f32> = (0..FFT_SIZE * 3 + 17)
+            .map(|i| (i as f32 * 0.1).sin())
+            .collect();
+        let mut streaming = StreamingSpectrum::new(1);
+        for packet in samples.chunks(137) {
+            streaming.push(packet).unwrap();
+        }
+        let actual = streaming.finish().unwrap();
+        let (expected, _) = avg_power_spectrum(&samples);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn insufficient_or_invalid_signal_is_not_clean() {
+        let mut short = StreamingSpectrum::new(1);
+        short.push(&[0.5; 100]).unwrap();
+        assert!(short.finish().is_err());
+        let mut silent = StreamingSpectrum::new(1);
+        silent.push(&vec![0.0; FFT_SIZE]).unwrap();
+        assert!(silent.finish().is_err());
+        assert!(StreamingSpectrum::new(1).push(&[f32::INFINITY]).is_err());
+    }
+
+    #[test]
     fn blackman_harris_endpoint_and_symmetry() {
         let w = blackman_harris(FFT_SIZE);
         // i=0: A0 - A1 + A2 - A3 ≈ 0.00006.
@@ -340,14 +430,22 @@ mod tests {
             *s /= peak;
         }
 
-        let feat = analyze(
-            &samples,
+        let (energy, _) = avg_power_spectrum(&samples);
+        let feat = analyze_energy(
+            &energy,
             SR,
-            SpectrumOpts { peak_db: Some(40.0), threshold_mult: 10.0 },
+            SpectrumOpts {
+                peak_db: Some(40.0),
+                threshold_mult: 10.0,
+            },
         );
 
         let nyquist = SR as f32 / 2.0;
-        assert!(feat.cutoff_hz < nyquist - 2_000.0, "cutoff not detected: {}", feat.cutoff_hz);
+        assert!(
+            feat.cutoff_hz < nyquist - 2_000.0,
+            "cutoff not detected: {}",
+            feat.cutoff_hz
+        );
         assert!(
             (feat.cutoff_hz - CUT_HZ).abs() < 2_000.0,
             "cutoff off target: {} (want ~{CUT_HZ})",

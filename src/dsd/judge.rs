@@ -71,10 +71,9 @@ impl DsdFlag {
                 "缺乏自然噪声整形上扬（疑似 PCM 转制）",
                 "lacks natural noise-shaping rise (likely PCM-sourced)",
             ),
-            DsdFlag::LowHfEnergy => lang.pick(
-                "超高频能量异常偏低",
-                "abnormally low ultrasonic energy",
-            ),
+            DsdFlag::LowHfEnergy => {
+                lang.pick("超高频能量异常偏低", "abnormally low ultrasonic energy")
+            }
             DsdFlag::CdCutoff => lang.pick(
                 "22 kHz 处硬截止（疑似 CD/PCM 来源）",
                 "hard cutoff at ~22 kHz (likely CD/PCM source)",
@@ -87,10 +86,9 @@ impl DsdFlag {
                 "低位截止（疑似有损来源）",
                 "low baseband cutoff (likely lossy source)",
             ),
-            DsdFlag::SuspiciousCutoff => lang.pick(
-                "基带存在可疑截止",
-                "suspicious baseband cutoff",
-            ),
+            DsdFlag::SuspiciousCutoff => {
+                lang.pick("基带存在可疑截止", "suspicious baseband cutoff")
+            }
         }
     }
 }
@@ -211,7 +209,10 @@ mod tests {
         let th = DsdThresholds::default();
         for cutoff in [17_916.0, 19_466.0, 19_638.0, 23_170.0] {
             let (flags, status) = judge(18.0, 0.99, Some(cutoff), false, &th);
-            assert!(flags.is_empty(), "cutoff {cutoff} should not flag: {flags:?}");
+            assert!(
+                flags.is_empty(),
+                "cutoff {cutoff} should not flag: {flags:?}"
+            );
             assert_eq!(status, VerdictStatus::Pass);
         }
     }

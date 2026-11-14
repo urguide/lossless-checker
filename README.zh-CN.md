@@ -6,7 +6,7 @@
 无损的文件；以及**假 Hi-Res**——把 CD/有损素材上采样塞进 96/192 kHz 容器。可对单个文件给出判断，
 也可对整个音乐库批量扫描、输出排好序的可疑清单。
 
-- **严格只读**——只分析、只报告，绝不移动、改名或删除任何文件。
+- **保護輸入檔案**——音訊以唯讀方式開啟；報告與 CSV 只建立新檔，不覆寫既有檔案或連結目標。
 - **纯 Rust、零系统依赖**——FLAC/ALAC/WAV/AIFF/CAF 走 symphonia;DSD（`.dsf`/`.dff`）走原生
   [`check-dsd`](#dsd-真伪检测-check-dsd) 子命令。
 - **Hi-Res 感知**——可检测上采样、空高频段、以及频谱空洞。
@@ -67,12 +67,7 @@ cd lossless-checker-*/
 ./lossless-checker check "path/to/song.flac"
 ```
 
-在 macOS 上，从网络下载的二进制会被 Gatekeeper 隔离。若提示*"无法打开，因为无法验证开发者"*，
-执行一次以下命令清除隔离标记：
-
-```bash
-xattr -d com.apple.quarantine ./lossless-checker
-```
+macOS 若無法驗證開發者，請先核對下載來源、SHA-256 與建置來源證明，或從審閱過的原始碼自行編譯。
 
 想在任意目录运行，把它移到 `PATH` 上，例如 `sudo mv lossless-checker /usr/local/bin/`。
 
@@ -84,19 +79,39 @@ xattr -d com.apple.quarantine ./lossless-checker
 .\lossless-checker.exe check "path\to\song.flac"
 ```
 
-若 SmartScreen 提示应用无法识别，点**更多信息 → 仍要运行**。
+Windows 若 SmartScreen 無法識別程式，請驗證來源與建置證明，或自行編譯。
 
-> `<版本>` 占位符对应发布标签，如 `v0.1.0`。下面[使用](#使用)示例里凡是写 `cargo run --release --`
+> 新套件的 `<版本>` 使用來源 commit 前 12 碼（舊版使用 tag）。下面[使用](#使用)示例里凡是写 `cargo run --release --`
 > 的地方，都可替换成二进制路径（`./lossless-checker`）。
 
 ## 构建
 
-若想从源码构建（需要 [Rust 工具链](https://rustup.rs/)）：
+若想从源码构建（需要 [Rust 工具链](https://rustup.rs/) 1.100 以上）：
 
 ```bash
-cargo build --release
+cargo build --locked --release
 # 可执行文件在 ./target/release/lossless-checker
 ```
+
+## 自動編譯與安全行為
+
+每次 branch push 或 pull request 都會執行格式、Clippy、單元測試、安全回歸測試與 OSV 依賴檢查，
+通過後編譯 Linux GNU/musl、macOS Intel/Apple Silicon、Windows x64。
+到 **Actions → Test, build and package → Artifacts** 下載壓縮包與 SHA-256，保留 14 天。
+推送 `v*` tag 時另外建立 Release 與建置來源證明，可用
+`gh attestation verify <壓縮包> --repo <owner>/<repo>` 驗證；雜湊本身不代表發佈者身分驗證。
+
+- 輸出路徑必須尚不存在，重跑請換檔名；不允許覆寫音訊、既有報告或連結目標。
+- 只讀取一般檔案，跳過目錄內的符號連結與特殊檔案；無法完整列舉時回報失敗。每次最多列舉一百萬個項目。
+- PCM 改用串流分聲道功率頻譜，不再整首放入記憶體，也不會讓反相聲道互相抵消。
+  分析範圍為 1–8 聲道、38–768 kHz；靜音、樣本不足、非有限數值、已偵測的解碼錯誤／截斷皆不判通過。
+  EOF 與截斷的區分仍受格式提供的樣本數及完整性檢查限制，本工具不是通用檔案完整性驗證器。
+- DSD 驗證區塊邊界、樣本數、1–8 聲道、1–50 MHz、DSF 4096-byte block 及 DFF PROP 上限 1 MiB；
+  FFT 限 1024–262144 的二次冪。
+- 預設執行緒為 `min(CPU 核數, 4)`，`--jobs` 限 1–32；批次有讀取／解析錯誤時回傳非零 exit code。
+- `clean`／DSD `pass` 只是未發現線索，不是來源保證。PCM 經 Sigma-Delta 調制同樣能產生噪聲整形，
+  不能用它證明原生 DSD；CD／PCM 來源也不等於使用過有損編碼。
+- 第三方解碼器未在沙箱內執行；處理不可信上傳檔案時，仍應使用作業系統資源限制與程序隔離。
 
 ## 使用
 
@@ -194,7 +209,7 @@ cargo run --release -- check ~/Music --report scan.txt --json scan.json
 | `--report`     | stdout                  | 把文本报告写到此文件（仅目录扫描）。 |
 | `--json`       | —                       | 额外把 JSON 报告写到此文件（仅目录扫描）。 |
 | `--ext`        | `flac,wav,m4a,aif,aiff,caf,alac` | 逗号分隔的扫描扩展名。只扫无损/PCM 容器——扫 mp3 等本身有损的格式没有意义,DSD 走 `check-dsd`。 |
-| `--jobs`       | CPU 核数                | 并行线程数。 |
+| `--jobs`       | min(CPU 核數, 4)        | 並行執行緒數，1–32。 |
 | `--lang`       | `zh`                    | 日志与报告的语言：`zh`（中文，默认）或 `en`。JSON 报告不受影响。 |
 
 ### 判定区间
@@ -233,9 +248,8 @@ cargo run --release -- check-dsd ~/DSD --album-summary
 ```
 
 `check-dsd` **零系统依赖**。它自己解析 `.dsf`/`.dff` 容器，取出原始 1-bit 流，直接计算其全频段功率谱
-（到 DSD 奈奎斯特，DSD64 约 1.41 MHz）。这暴露了转制者难以低成本伪造的物理指纹：**噪声整形**
-——真 DSD 母带把 Sigma-Delta 量化噪声推向 50–100 kHz，频谱在那里显著上扬（正斜率）。由 PCM/有损
-转制的假 DSD 缺这段上扬，且基带常残留 CD/有损截止。整条比特流流式处理，内存与文件大小解耦。
+（到 DSD 奈奎斯特，DSD64 约 1.41 MHz），量測噪聲整形與基帶截止。PCM 經 Sigma-Delta 重調制
+同樣會產生噪聲整形，因此不能證明原生 DSD；基帶截止也只是輔助線索。比特流以串流方式處理。
 
 每个文件按三项指标判 **Pass** / **Suspicious** / **Unsupported**：噪声整形斜率（dB/oct）、超高频
 能量占比（>50 kHz）、基带截止（只看 ≤24 kHz，故 DXD 工作流的 176 kHz 拐点不会被误判为 CD 墙）。

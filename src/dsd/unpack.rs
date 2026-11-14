@@ -79,7 +79,11 @@ mod tests {
             unpack_block(&[byte], BitOrder::Msb, &mut msb);
             for i in 0..8 {
                 let want_lsb = if (byte >> i) & 1 == 1 { 1.0 } else { -1.0 };
-                let want_msb = if (byte >> (7 - i)) & 1 == 1 { 1.0 } else { -1.0 };
+                let want_msb = if (byte >> (7 - i)) & 1 == 1 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 assert_eq!(lsb[i], want_lsb, "LSB byte {byte} bit {i}");
                 assert_eq!(msb[i], want_msb, "MSB byte {byte} bit {i}");
             }

@@ -21,6 +21,7 @@ mod decode;
 mod dsd;
 mod i18n;
 mod report;
+mod safety;
 mod spectrum;
 mod verdict;
 
@@ -90,7 +91,7 @@ struct CheckArgs {
     #[arg(long, default_value = "flac,wav,m4a,aif,aiff,caf,alac")]
     ext: String,
 
-    /// Number of parallel worker threads (default: number of CPU cores)
+    /// Number of parallel worker threads, 1..=32 (default: CPU cores capped at 4)
     #[arg(long)]
     jobs: Option<usize>,
 
@@ -128,7 +129,7 @@ struct CheckDsdArgs {
     #[arg(long, default_value_t = 0.05)]
     min_hf_ratio: f64,
 
-    /// Number of parallel worker threads (default: number of CPU cores)
+    /// Number of parallel worker threads, 1..=32 (default: CPU cores capped at 4)
     #[arg(long, short = 'j')]
     jobs: Option<usize>,
 
@@ -187,15 +188,22 @@ fn main() {
 
 /// `check` subcommand: the PCM fake-lossless detector.
 fn run_check(cli: CheckArgs) {
-    if let Some(jobs) = cli.jobs {
-        // Best-effort: ignore the error if a global pool was already built.
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build_global();
+    if !cli.peak_db.is_finite()
+        || !(1.0..=120.0).contains(&cli.peak_db)
+        || !cli.threshold.is_finite()
+        || cli.threshold <= 0.0
+    {
+        eprintln!("invalid detection threshold");
+        exit(2);
     }
+    configure_jobs(cli.jobs);
 
     // None = legacy noise-floor method (with --threshold); Some(db) = peak-relative (default).
-    let peak_db = if cli.noise_floor { None } else { Some(cli.peak_db) };
+    let peak_db = if cli.noise_floor {
+        None
+    } else {
+        Some(cli.peak_db)
+    };
 
     if cli.path.is_file() {
         // --report / --json only apply to directory scans; warn rather than silently drop them.
@@ -214,8 +222,11 @@ fn run_check(cli: CheckArgs) {
     } else {
         eprintln!(
             "{}: {}",
-            cli.lang.pick("路径不存在或无法访问", "path does not exist or is not accessible"),
-            cli.path.display()
+            cli.lang.pick(
+                "路径不存在或无法访问",
+                "path does not exist or is not accessible"
+            ),
+            safety::display(&cli.path)
         );
         exit(1);
     }
@@ -223,11 +234,7 @@ fn run_check(cli: CheckArgs) {
 
 /// `check-dsd` subcommand: native DSD authenticity check.
 fn run_dsd(cli: CheckDsdArgs) {
-    if let Some(jobs) = cli.jobs {
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(jobs)
-            .build_global();
-    }
+    configure_jobs(cli.jobs);
 
     let thresholds = DsdThresholds {
         min_noise_shaping_slope: cli.min_slope,
@@ -252,6 +259,7 @@ fn run_dsd(cli: CheckDsdArgs) {
 
 /// `export-spectrum` subcommand: dump a single file's power spectrum to CSV.
 fn run_export(cli: ExportSpectrumArgs) {
+    configure_jobs(None);
     let channel = match cli.channel.trim().to_ascii_lowercase().as_str() {
         "mix" => ChannelSel::Mix,
         other => match other.parse::<usize>() {
@@ -279,6 +287,25 @@ fn run_export(cli: ExportSpectrumArgs) {
     exit(code);
 }
 
+fn configure_jobs(jobs: Option<usize>) {
+    let jobs = jobs.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(4)
+    });
+    if !(1..=32).contains(&jobs) {
+        eprintln!("--jobs must be in 1..=32");
+        exit(2);
+    }
+    if let Err(e) = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build_global()
+    {
+        eprintln!("failed to initialize workers: {e}");
+        exit(1);
+    }
+}
+
 /// Build the detection options from CLI knobs.
 fn opts(threshold: f64, peak_db: Option<f64>) -> SpectrumOpts {
     SpectrumOpts {
@@ -292,18 +319,25 @@ fn run_single(path: &Path, threshold: f64, peak_db: Option<f64>, lang: Lang) {
     let decoded = match decode_audio(path, lang) {
         Ok(d) => d,
         Err(e) => {
-            eprintln!("{}: {e}", lang.pick("解码失败", "decode failed"));
+            eprintln!(
+                "{}: {}",
+                lang.pick("解码失败", "decode failed"),
+                safety::escape(&e)
+            );
             exit(1);
         }
     };
 
-    if decoded.samples.is_empty() {
-        eprintln!("{}", lang.pick("没有解码出任何采样", "no samples were decoded"));
+    if decoded.sample_count == 0 {
+        eprintln!(
+            "{}",
+            lang.pick("没有解码出任何采样", "no samples were decoded")
+        );
         exit(1);
     }
 
-    let features = spectrum::analyze(
-        &decoded.samples,
+    let features = spectrum::analyze_energy(
+        &decoded.energy,
         decoded.sample_rate,
         opts(threshold, peak_db),
     );
@@ -315,11 +349,23 @@ fn run_single(path: &Path, threshold: f64, peak_db: Option<f64>, lang: Lang) {
     };
     let verdict = classify(&features, decoded.sample_rate);
 
-    println!("{}: {}", lang.pick("文件", "File"), path.display());
+    println!("{}: {}", lang.pick("文件", "File"), safety::display(path));
     println!("{}: {}", lang.pick("格式", "Format"), decoded.format_label);
-    println!("{}: {} Hz", lang.pick("采样率", "Sample rate"), decoded.sample_rate);
-    println!("{}: {}", lang.pick("采样总数", "Total samples"), decoded.samples.len());
-    println!("{}: {:.0} Hz", lang.pick("奈奎斯特频率", "Nyquist frequency"), nyquist);
+    println!(
+        "{}: {} Hz",
+        lang.pick("采样率", "Sample rate"),
+        decoded.sample_rate
+    );
+    println!(
+        "{}: {}",
+        lang.pick("采样总数", "Total samples"),
+        decoded.sample_count
+    );
+    println!(
+        "{}: {:.0} Hz",
+        lang.pick("奈奎斯特频率", "Nyquist frequency"),
+        nyquist
+    );
     println!(
         "{}: {:.0} Hz ({:.1}% of Nyquist)",
         lang.pick("估计高频截止", "Estimated HF cutoff"),
@@ -330,31 +376,50 @@ fn run_single(path: &Path, threshold: f64, peak_db: Option<f64>, lang: Lang) {
         println!(
             "{}: {db:.1} dB ({})",
             lang.pick("高频延伸(>26kHz)", "HF extension (>26kHz)"),
-            lang.pick("相对频谱峰值；越低代表高频越空", "relative to spectral peak; lower = emptier highs")
+            lang.pick(
+                "相对频谱峰值；越低代表高频越空",
+                "relative to spectral peak; lower = emptier highs"
+            )
         );
     }
     if features.holes.is_empty() {
-        println!("{}", lang.pick("频谱空洞: 无明显空洞", "Spectral holes: none significant"));
+        println!(
+            "{}",
+            lang.pick("频谱空洞: 无明显空洞", "Spectral holes: none significant")
+        );
     } else {
         println!(
             "{}: {} {}",
             lang.pick("频谱空洞", "Spectral holes"),
             features.holes.len(),
-            lang.pick("处（仅供参考，不影响判定）", "(informational only, does not affect the verdict)")
+            lang.pick(
+                "处（仅供参考，不影响判定）",
+                "(informational only, does not affect the verdict)"
+            )
         );
         for h in &features.holes {
             match lang {
                 Lang::Zh => {
-                    println!("  - {:.0}-{:.0} Hz（深约 {:.0} dB）", h.low_hz, h.high_hz, h.depth_db)
+                    println!(
+                        "  - {:.0}-{:.0} Hz（深约 {:.0} dB）",
+                        h.low_hz, h.high_hz, h.depth_db
+                    )
                 }
                 Lang::En => {
-                    println!("  - {:.0}-{:.0} Hz (~{:.0} dB deep)", h.low_hz, h.high_hz, h.depth_db)
+                    println!(
+                        "  - {:.0}-{:.0} Hz (~{:.0} dB deep)",
+                        h.low_hz, h.high_hz, h.depth_db
+                    )
                 }
             }
         }
     }
     println!();
-    println!("{}: {}", lang.pick("判断", "Verdict"), verdict.sentence(lang));
+    println!(
+        "{}: {}",
+        lang.pick("判断", "Verdict"),
+        verdict.sentence(lang)
+    );
     println!();
     println!(
         "{}",
@@ -388,30 +453,49 @@ fn run_batch(cli: &CheckArgs) {
         lang.pick("扩展名", "extensions"),
         exts.join(", ")
     );
-    let mut files = collect_audio_files(&cli.path, &exts);
+    let mut files = match collect_audio_files(&cli.path, &exts) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!("cannot completely enumerate input directory: {e}");
+            exit(1);
+        }
+    };
     files.sort();
 
     if files.is_empty() {
         eprintln!(
             "{} {}",
-            lang.pick("在以下目录未找到匹配的音频文件:", "no matching audio files found under"),
-            cli.path.display()
+            lang.pick(
+                "在以下目录未找到匹配的音频文件:",
+                "no matching audio files found under"
+            ),
+            safety::display(&cli.path)
         );
         exit(1);
     }
 
     let total = files.len();
-    eprintln!("{}", lang.pick(&format!("找到 {total} 个文件，开始扫描…"), &format!("Found {total} files, scanning…")));
+    eprintln!(
+        "{}",
+        lang.pick(
+            &format!("找到 {total} 个文件，开始扫描…"),
+            &format!("Found {total} files, scanning…")
+        )
+    );
 
     let done = AtomicUsize::new(0);
     let threshold = cli.threshold;
-    let peak_db = if cli.noise_floor { None } else { Some(cli.peak_db) };
+    let peak_db = if cli.noise_floor {
+        None
+    } else {
+        Some(cli.peak_db)
+    };
     let mut outcomes: Vec<Outcome> = files
         .par_iter()
         .map(|p| {
             let o = analyze_file(p, threshold, peak_db, lang);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 25 == 0 || n == total {
+            if n.is_multiple_of(25) || n == total {
                 eprint!("\r{} {n}/{total}", lang.pick("扫描中…", "Scanning…"));
                 let _ = io::stderr().flush();
             }
@@ -424,10 +508,18 @@ fn run_batch(cli: &CheckArgs) {
 
     let text = build_text_report(&cli.path, &outcomes, lang);
     match &cli.report {
-        Some(p) => match std::fs::write(p, &text) {
-            Ok(()) => eprintln!("{}: {}", lang.pick("文本报告已写入", "Text report written to"), p.display()),
+        Some(p) => match safety::create_output(p).and_then(|mut f| f.write_all(text.as_bytes())) {
+            Ok(()) => eprintln!(
+                "{}: {}",
+                lang.pick("文本报告已写入", "Text report written to"),
+                safety::display(p)
+            ),
             Err(e) => {
-                eprintln!("{} ({}): {e}", lang.pick("写文本报告失败", "failed to write text report"), p.display());
+                eprintln!(
+                    "{} ({}): {e}",
+                    lang.pick("写文本报告失败", "failed to write text report"),
+                    safety::display(p)
+                );
                 exit(1);
             }
         },
@@ -439,61 +531,83 @@ fn run_batch(cli: &CheckArgs) {
         let serialized = match serde_json::to_string_pretty(&json) {
             Ok(s) => s,
             Err(e) => {
-                eprintln!("{}: {e}", lang.pick("序列化 JSON 失败", "failed to serialize JSON"));
+                eprintln!(
+                    "{}: {e}",
+                    lang.pick("序列化 JSON 失败", "failed to serialize JSON")
+                );
                 exit(1);
             }
         };
-        match std::fs::write(p, serialized) {
-            Ok(()) => eprintln!("{}: {}", lang.pick("JSON 报告已写入", "JSON report written to"), p.display()),
+        match safety::create_output(p).and_then(|mut f| f.write_all(serialized.as_bytes())) {
+            Ok(()) => eprintln!(
+                "{}: {}",
+                lang.pick("JSON 报告已写入", "JSON report written to"),
+                safety::display(p)
+            ),
             Err(e) => {
-                eprintln!("{} ({}): {e}", lang.pick("写 JSON 报告失败", "failed to write JSON report"), p.display());
+                eprintln!(
+                    "{} ({}): {e}",
+                    lang.pick("写 JSON 报告失败", "failed to write JSON report"),
+                    safety::display(p)
+                );
                 exit(1);
             }
         }
     }
-}
-
-/// Recursively collect files whose extension matches `exts`. Skips symlinked directories to avoid
-/// cycles; unreadable entries are silently skipped (they can't be audio we care about).
-fn collect_audio_files(root: &Path, exts: &[String]) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_into(root, exts, &mut out);
-    out
-}
-
-fn collect_into(dir: &Path, exts: &[String], out: &mut Vec<PathBuf>) {
-    let entries = match std::fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        // Use symlink-aware metadata so we never follow a symlinked directory into a loop.
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        if meta.is_dir() {
-            if !meta.file_type().is_symlink() {
-                collect_into(&path, exts, out);
-            }
-        } else if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if exts.iter().any(|want| want == &ext.to_ascii_lowercase()) {
-                out.push(path);
-            }
-        }
+    if outcomes.iter().any(|o| o.result.is_err()) {
+        exit(1);
     }
 }
 
-/// Decode + analyze one file, capturing any failure as an error string (never panics).
+/// Iterative traversal, without following links or silently omitting unreadable directories.
+fn collect_audio_files(root: &Path, exts: &[String]) -> io::Result<Vec<PathBuf>> {
+    if !std::fs::symlink_metadata(root)?.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "scan root must be a non-symlink directory",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    let mut visited = 0usize;
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir)? {
+            let entry = entry?;
+            visited += 1;
+            if visited > 1_000_000 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "scan exceeds one million entries; split the library",
+                ));
+            }
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(path);
+            } else if kind.is_file() {
+                let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                    continue;
+                };
+                if exts.iter().any(|want| want == &ext.to_ascii_lowercase()) {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Decode + analyze one file. Decoder errors are surfaced in the report.
 fn analyze_file(path: &Path, threshold: f64, peak_db: Option<f64>, lang: Lang) -> Outcome {
     let result = (|| {
         let decoded = decode_audio(path, lang)?;
-        if decoded.samples.is_empty() {
-            return Err(lang.pick("没有解码出任何采样", "no samples were decoded").to_string());
+        if decoded.sample_count == 0 {
+            return Err(lang
+                .pick("没有解码出任何采样", "no samples were decoded")
+                .to_string());
         }
-        let features = spectrum::analyze(
-            &decoded.samples,
+        let features = spectrum::analyze_energy(
+            &decoded.energy,
             decoded.sample_rate,
             opts(threshold, peak_db),
         );

@@ -32,6 +32,10 @@ pub struct ExportArgs {
 pub fn run_export_spectrum(args: ExportArgs) -> i32 {
     let lang = args.lang;
 
+    if let Err(e) = crate::dsd::validate_fft_size(args.fft_size) {
+        eprintln!("{e}");
+        return 2;
+    }
     let mut reader = match open_reader(&args.file) {
         Ok(r) => r,
         Err(e) => {
@@ -65,14 +69,18 @@ pub fn run_export_spectrum(args: ExportArgs) -> i32 {
             eprintln!(
                 "{}: {} ({} {})",
                 lang.pick("已写入频谱 CSV", "Spectrum CSV written"),
-                out.display(),
+                crate::safety::display(&out),
                 rows,
                 lang.pick("行", "rows")
             );
             0
         }
         Err(e) => {
-            eprintln!("{} ({}): {e}", lang.pick("写 CSV 失败", "failed to write CSV"), out.display());
+            eprintln!(
+                "{} ({}): {e}",
+                lang.pick("写 CSV 失败", "failed to write CSV"),
+                crate::safety::display(&out)
+            );
             1
         }
     }
@@ -85,9 +93,8 @@ fn select_power(
     fft_size: usize,
 ) -> Result<Vec<f64>, String> {
     match sel {
-        ChannelSel::Mix => {
-            mix_power(per_channel, fft_size).ok_or_else(|| "no usable audio / file too short".into())
-        }
+        ChannelSel::Mix => mix_power(per_channel, fft_size)
+            .ok_or_else(|| "no usable audio / file too short".into()),
         ChannelSel::Index(i) => {
             let (power, frames) = per_channel
                 .get(*i)
@@ -108,7 +115,7 @@ fn default_output(file: &Path) -> PathBuf {
 
 /// Write `frequency_hz,power_db` rows. Returns the number of data rows written.
 fn write_csv(out: &Path, ps: &PowerSpectrum) -> std::io::Result<usize> {
-    let mut w = BufWriter::new(std::fs::File::create(out)?);
+    let mut w = BufWriter::new(crate::safety::create_output(out)?);
     writeln!(w, "frequency_hz,power_db")?;
     let mut rows = 0;
     for (i, &p) in ps.power.iter().enumerate() {

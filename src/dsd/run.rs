@@ -53,27 +53,62 @@ struct DsdOutcome {
 /// Entry point for the `check-dsd` subcommand. Returns the process exit code.
 pub fn run_check_dsd(args: DsdCheckArgs) -> i32 {
     let lang = args.lang;
+    let th = &args.thresholds;
+    if crate::dsd::validate_fft_size(args.fft_size).is_err()
+        || ![
+            th.min_noise_shaping_slope,
+            th.min_hf_ratio,
+            th.slope_fit_lo_hz,
+            th.slope_fit_hi_hz,
+            th.hf_threshold_hz,
+        ]
+        .iter()
+        .all(|x| x.is_finite())
+        || !(0.0..=1.0).contains(&th.min_hf_ratio)
+        || th.min_noise_shaping_slope < 0.0
+        || th.slope_fit_lo_hz <= 0.0
+        || th.slope_fit_lo_hz >= th.slope_fit_hi_hz
+        || th.slope_fit_hi_hz >= DSD64_RATE_HZ / 2.0
+        || th.hf_threshold_hz <= 0.0
+        || th.hf_threshold_hz >= DSD64_RATE_HZ / 2.0
+    {
+        eprintln!("invalid FFT size or DSD thresholds");
+        return 2;
+    }
     let exts = [String::from("dsf"), String::from("dff")];
 
     let mut files = Vec::new();
     for p in &args.paths {
         if p.is_dir() {
-            files.extend(crate::collect_audio_files(p, &exts));
+            match crate::collect_audio_files(p, &exts) {
+                Ok(found) => files.extend(found),
+                Err(e) => {
+                    eprintln!("cannot completely enumerate input directory: {e}");
+                    return 1;
+                }
+            }
         } else if p.is_file() && has_dsd_ext(p) {
             files.push(p.clone());
         } else {
             eprintln!(
                 "{}: {}",
-                lang.pick("跳过（非 DSD 文件或路径不存在）", "skipped (not a DSD file or missing)"),
-                p.display()
+                lang.pick(
+                    "跳过（非 DSD 文件或路径不存在）",
+                    "skipped (not a DSD file or missing)"
+                ),
+                crate::safety::display(p)
             );
+            return 1;
         }
     }
     files.sort();
     files.dedup();
 
     if files.is_empty() {
-        eprintln!("{}", lang.pick("未找到 .dsf / .dff 文件", "no .dsf / .dff files found"));
+        eprintln!(
+            "{}",
+            lang.pick("未找到 .dsf / .dff 文件", "no .dsf / .dff files found")
+        );
         return 1;
     }
 
@@ -97,11 +132,14 @@ pub fn run_check_dsd(args: DsdCheckArgs) -> i32 {
         .map(|p| {
             let result = analyze_one(p, fft_size, th, parallel_frames);
             let n = done.fetch_add(1, Ordering::Relaxed) + 1;
-            if n % 10 == 0 || n == total {
+            if n.is_multiple_of(10) || n == total {
                 eprint!("\r{} {n}/{total}", lang.pick("分析中…", "Analyzing…"));
                 let _ = io::stderr().flush();
             }
-            DsdOutcome { path: p.clone(), result }
+            DsdOutcome {
+                path: p.clone(),
+                result,
+            }
         })
         .collect();
     eprintln!();
@@ -112,19 +150,32 @@ pub fn run_check_dsd(args: DsdCheckArgs) -> i32 {
         match serde_json::to_string_pretty(&build_json(&outcomes)) {
             Ok(s) => println!("{s}"),
             Err(e) => {
-                eprintln!("{}: {e}", lang.pick("序列化 JSON 失败", "failed to serialize JSON"));
+                eprintln!(
+                    "{}: {e}",
+                    lang.pick("序列化 JSON 失败", "failed to serialize JSON")
+                );
                 return 1;
             }
         }
     } else {
-        print!("{}", build_text(&root, &outcomes, args.album_summary, args.verbose, lang));
+        print!(
+            "{}",
+            build_text(&root, &outcomes, args.album_summary, args.verbose, lang)
+        );
     }
-    0
+    if outcomes.iter().any(|o| o.result.is_err()) {
+        1
+    } else {
+        0
+    }
 }
 
 fn has_dsd_ext(p: &Path) -> bool {
     matches!(
-        p.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref(),
+        p.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
         Some("dsf") | Some("dff")
     )
 }
@@ -146,7 +197,12 @@ fn scan_root(paths: &[PathBuf]) -> PathBuf {
 // --- per-file analysis ---
 
 fn container_of(path: &Path) -> Option<DsdContainer> {
-    match path.extension().and_then(|e| e.to_str()).map(|e| e.to_ascii_lowercase()).as_deref() {
+    match path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
+    {
         Some("dsf") => Some(DsdContainer::Dsf),
         Some("dff") => Some(DsdContainer::Dff),
         _ => None,
@@ -202,22 +258,28 @@ pub(crate) fn accumulate(
     parallel_frames: bool,
 ) -> Result<(DsdMeta, ChannelSpectra), DsdError> {
     let meta = reader.meta().clone();
+    crate::dsd::validate_fft_size(fft_size)?;
+    crate::dsd::validate_meta(meta.channels as usize, meta.sample_rate)?;
     let channels = meta.channels.max(1) as usize;
     let half = fft_size / 2;
 
     let plan = WelchPlan::new(fft_size);
     // Parallelize frames within a file only when this file has the pool to itself; when the caller
     // is already parallel across files, a nested per-frame `par_iter` just oversubscribes the pool.
-    let threads = if parallel_frames { rayon::current_num_threads().max(1) } else { 1 };
-    let mut workers = plan.worker_pool(threads); // allocated once, reused across every flush
-    // Per channel: running (power sum, frame count) and one persistent pending-sample buffer. Whole
-    // frames are FFT'd on flush and drained, leaving only the (<fft_size) partial-frame tail — which
-    // keeps the next batch's frames contiguous with this one's.
+    let threads = if parallel_frames {
+        rayon::current_num_threads().max(1)
+    } else {
+        1
+    };
+    // Allocated once, reused across every flush.
+    let mut workers = plan.worker_pool(threads);
+    // Per-channel power sums and a persistent buffer; carry partial frames into the next batch.
     let mut totals: ChannelSpectra = (0..channels).map(|_| (vec![0.0; half], 0u64)).collect();
     let mut pending: Vec<Vec<f32>> = (0..channels)
         .map(|_| Vec::with_capacity(FLUSH_SAMPLES_PER_CHANNEL + fft_size))
         .collect();
     let mut scratch: Vec<f32> = Vec::new();
+    let mut consumed = vec![0u64; channels];
 
     while let Some(group) = reader.next_block_group()? {
         for (c, bytes) in group.channels.iter().enumerate() {
@@ -225,11 +287,22 @@ pub(crate) fn accumulate(
                 break;
             }
             unpack_block(bytes, meta.bit_order, &mut scratch);
+            if let Some(total) = meta.total_samples_per_channel {
+                let usable = total.saturating_sub(consumed[c]).min(scratch.len() as u64) as usize;
+                scratch.truncate(usable);
+            }
+            consumed[c] += scratch.len() as u64;
             pending[c].extend_from_slice(&scratch);
         }
         if pending[0].len() >= FLUSH_SAMPLES_PER_CHANNEL {
             flush_pending(&plan, &mut workers, &mut pending, &mut totals);
         }
+    }
+    if meta
+        .total_samples_per_channel
+        .is_some_and(|total| consumed.iter().any(|&n| n != total))
+    {
+        return Err(DsdError::Truncated);
     }
     flush_pending(&plan, &mut workers, &mut pending, &mut totals);
 
@@ -324,7 +397,12 @@ fn analyze_stream(
     let slope = noise_shaping_slope(&ps, th.slope_fit_lo_hz * k, th.slope_fit_hi_hz * k);
     let hf_ratio = hf_energy_ratio(&ps, th.hf_threshold_hz * k);
     let cutoff = detect_baseband_cutoff(&ps, th.baseband_max_hz);
-    let cd_wall = detect_cd_wall(&ps, th.cd_cutoff_hz, th.cd_wall_step_db, th.cd_wall_floor_db);
+    let cd_wall = detect_cd_wall(
+        &ps,
+        th.cd_cutoff_hz,
+        th.cd_wall_step_db,
+        th.cd_wall_floor_db,
+    );
     let (flags, status) = judge(slope, hf_ratio, cutoff, cd_wall, th);
 
     Ok(DsdVerdict {
@@ -369,7 +447,7 @@ fn album_key(root: &Path, path: &Path, lang: Lang) -> String {
 }
 
 fn rel_display(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root).unwrap_or(path).to_string_lossy().into_owned()
+    crate::safety::display(path.strip_prefix(root).unwrap_or(path))
 }
 
 fn build_text(
@@ -407,23 +485,47 @@ fn build_text(
     }
 
     let mut s = String::new();
-    let _ = writeln!(s, "{}", lang.pick("DSD 真伪检测报告", "DSD authenticity report"));
-    let _ = writeln!(s, "{}: {}", lang.pick("生成时间", "Generated"), now_string());
-    let _ = writeln!(s, "{}: {}", lang.pick("扫描根目录", "Scan root"), root.display());
-    let _ = writeln!(s, "{}: {}", lang.pick("文件总数", "Total files"), outcomes.len());
+    let _ = writeln!(
+        s,
+        "{}",
+        lang.pick("DSD 真伪检测报告", "DSD authenticity report")
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("生成时间", "Generated"),
+        now_string()
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("扫描根目录", "Scan root"),
+        crate::safety::display(root)
+    );
+    let _ = writeln!(
+        s,
+        "{}: {}",
+        lang.pick("文件总数", "Total files"),
+        outcomes.len()
+    );
     let _ = writeln!(s);
     let _ = writeln!(s, "== {} ==", lang.pick("汇总", "Summary"));
     let _ = writeln!(s, "  ✅ {}  {pass}", lang.pick("通过", "Pass        "));
     let _ = writeln!(s, "  🚩 {}  {susp}", lang.pick("可疑", "Suspicious  "));
     let _ = writeln!(s, "  ⛔ {}  {unsup}", lang.pick("暂不支持", "Unsupported "));
-    let _ = writeln!(s, "  ✖  {}  {}", lang.pick("解析失败", "Parse error "), errors.len());
+    let _ = writeln!(
+        s,
+        "  ✖  {}  {}",
+        lang.pick("解析失败", "Parse error "),
+        errors.len()
+    );
     let _ = writeln!(s);
     let _ = writeln!(
         s,
         "{}",
         lang.pick(
-            "判据：真 DSD 有强噪声整形上扬(>50kHz)；缺斜率/低超高频能量/基带硬截止＝疑似 PCM/有损转制。",
-            "Genuine DSD shows strong noise-shaping rise (>50kHz); missing slope / low ultrasonic energy / a baseband cutoff => likely PCM/lossy-sourced."
+            "判据：噪声整形与基带截止仅提供线索；PCM 重调制同样可产生整形，不能证明原生 DSD 或有损历史。",
+            "Noise shaping and cutoffs are clues only: PCM re-modulation also shapes noise. Pass does not prove native DSD or lossless provenance."
         )
     );
     let _ = writeln!(
@@ -437,14 +539,22 @@ fn build_text(
 
     if album_summary {
         let _ = writeln!(s);
-        let _ = writeln!(s, "== {} ==", lang.pick("按专辑（🚩 数量降序）", "Albums (by 🚩 count, descending)"));
+        let _ = writeln!(
+            s,
+            "== {} ==",
+            lang.pick("按专辑（🚩 数量降序）", "Albums (by 🚩 count, descending)")
+        );
         if albums.is_empty() {
-            let _ = writeln!(s, "  {}", lang.pick("（无可疑文件）", "(no suspicious files)"));
+            let _ = writeln!(
+                s,
+                "  {}",
+                lang.pick("（无可疑文件）", "(no suspicious files)")
+            );
         } else {
             let mut ranked: Vec<(&String, &usize)> = albums.iter().collect();
             ranked.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
             for (name, count) in ranked {
-                let _ = writeln!(s, "  🚩{count:>3}  {name}");
+                let _ = writeln!(s, "  🚩{count:>3}  {}", crate::safety::escape(name));
             }
         }
     }
@@ -498,9 +608,18 @@ fn build_text(
 
     if !errors.is_empty() {
         let _ = writeln!(s);
-        let _ = writeln!(s, "== {} ==", lang.pick("解析失败（需人工检查）", "Parse failures (check manually)"));
+        let _ = writeln!(
+            s,
+            "== {} ==",
+            lang.pick("解析失败（需人工检查）", "Parse failures (check manually)")
+        );
         for (path, err) in &errors {
-            let _ = writeln!(s, "  ✖  {}  — {}", rel_display(root, path), err);
+            let _ = writeln!(
+                s,
+                "  ✖  {}  — {}",
+                rel_display(root, path),
+                crate::safety::escape(err)
+            );
         }
     }
 
@@ -517,7 +636,7 @@ fn cutoff_label(cutoff: Option<f64>, lang: Lang) -> String {
 /// `DsdVerdict.file` is already a display string; strip the root prefix for readability.
 fn rel_display_file(root: &Path, file: &str) -> String {
     let p = Path::new(file);
-    p.strip_prefix(root).unwrap_or(p).to_string_lossy().into_owned()
+    crate::safety::display(p.strip_prefix(root).unwrap_or(p))
 }
 
 // --- JSON report ---
@@ -545,7 +664,12 @@ struct DsdReportJson<'a> {
 }
 
 fn build_json(outcomes: &[DsdOutcome]) -> DsdReportJson<'_> {
-    let mut summary = DsdSummary { pass: 0, suspicious: 0, unsupported: 0, error: 0 };
+    let mut summary = DsdSummary {
+        pass: 0,
+        suspicious: 0,
+        unsupported: 0,
+        error: 0,
+    };
     let mut results = Vec::new();
     let mut errors = Vec::new();
 
@@ -569,7 +693,12 @@ fn build_json(outcomes: &[DsdOutcome]) -> DsdReportJson<'_> {
         }
     }
 
-    DsdReportJson { scanned: outcomes.len(), summary, results, errors }
+    DsdReportJson {
+        scanned: outcomes.len(),
+        summary,
+        results,
+        errors,
+    }
 }
 
 #[cfg(test)]
@@ -577,7 +706,6 @@ mod tests {
     use super::*;
     use crate::dsd::judge::DsdFlag;
     use std::f32::consts::PI;
-    use std::io::Write as _;
 
     const SR: u32 = 2_822_400; // DSD64
     const BLOCK: u32 = 4096; // bytes/channel/group
@@ -631,7 +759,11 @@ mod tests {
     /// Pack ±1 bits LSB-first (DSF order): bit i of sample 8k+i goes into byte k.
     fn pack_lsb(bits: &[bool]) -> Vec<u8> {
         bits.chunks(8)
-            .map(|c| c.iter().enumerate().fold(0u8, |b, (i, &on)| b | ((on as u8) << i)))
+            .map(|c| {
+                c.iter()
+                    .enumerate()
+                    .fold(0u8, |b, (i, &on)| b | ((on as u8) << i))
+            })
             .collect()
     }
 
@@ -665,7 +797,10 @@ mod tests {
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
         p.push(format!("lc_dsd_integ_{}_{id}.dsf", std::process::id()));
-        std::fs::File::create(&p).unwrap().write_all(bytes).unwrap();
+        crate::safety::create_output(&p)
+            .unwrap()
+            .write_all(bytes)
+            .unwrap();
         p
     }
 
@@ -687,7 +822,10 @@ mod tests {
 
     /// Lower the slope gate so the 1st-order modulator's ~+6 dB/oct counts as genuine SDM.
     fn test_thresholds() -> DsdThresholds {
-        DsdThresholds { min_noise_shaping_slope: 3.0, ..Default::default() }
+        DsdThresholds {
+            min_noise_shaping_slope: 3.0,
+            ..Default::default()
+        }
     }
 
     /// Naive 1-bit conversion with NO noise shaping: just the sign of each sample. The quantization
@@ -711,8 +849,16 @@ mod tests {
     #[test]
     fn synthetic_genuine_dsd_passes() {
         let v = verdict_of(&sdm2(&band_limited(26_000.0)));
-        assert!(v.noise_shaping_slope > 3.0, "slope = {}", v.noise_shaping_slope);
-        assert_eq!(v.baseband_cutoff_hz, None, "unexpected cutoff: {:?}", v.baseband_cutoff_hz);
+        assert!(
+            v.noise_shaping_slope > 3.0,
+            "slope = {}",
+            v.noise_shaping_slope
+        );
+        assert_eq!(
+            v.baseband_cutoff_hz, None,
+            "unexpected cutoff: {:?}",
+            v.baseband_cutoff_hz
+        );
         assert_eq!(v.status, VerdictStatus::Pass, "flags = {:?}", v.flags);
     }
 
@@ -722,8 +868,16 @@ mod tests {
     #[test]
     fn synthetic_unshaped_fake_is_suspicious() {
         let v = verdict_of(&sign_quantize(&band_limited(12_000.0)));
-        assert!(v.noise_shaping_slope < 3.0, "slope unexpectedly steep: {}", v.noise_shaping_slope);
+        assert!(
+            v.noise_shaping_slope < 3.0,
+            "slope unexpectedly steep: {}",
+            v.noise_shaping_slope
+        );
         assert_eq!(v.status, VerdictStatus::Suspicious);
-        assert!(v.flags.contains(&DsdFlag::WeakNoiseShaping), "flags = {:?}", v.flags);
+        assert!(
+            v.flags.contains(&DsdFlag::WeakNoiseShaping),
+            "flags = {:?}",
+            v.flags
+        );
     }
 }

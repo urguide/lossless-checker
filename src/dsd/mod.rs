@@ -26,6 +26,26 @@ pub use run::{run_check_dsd, DsdCheckArgs};
 
 use std::fmt;
 
+pub(crate) const MAX_CHANNELS: usize = 8;
+
+pub(crate) fn validate_fft_size(size: usize) -> Result<(), DsdError> {
+    if !(1024..=262_144).contains(&size) || !size.is_power_of_two() {
+        return Err(DsdError::Invalid(
+            "FFT size must be a power of two in 1024..=262144".into(),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_meta(channels: usize, rate: u64) -> Result<(), DsdError> {
+    if !(1..=MAX_CHANNELS).contains(&channels) || !(1_000_000..=50_000_000).contains(&rate) {
+        return Err(DsdError::Invalid(
+            "invalid DSD channel count or sample rate".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Unified DSD stream metadata, abstracting over the container differences.
 #[derive(Debug, Clone)]
 pub struct DsdMeta {
@@ -35,8 +55,7 @@ pub struct DsdMeta {
     pub sample_rate: u64,
     pub bit_order: BitOrder,
     /// Samples per channel, when the container records it (DFF derives it from the payload size).
-    /// Parsed for future exact tail trimming of the final (zero-padded) block.
-    #[allow(dead_code)]
+    /// Used to trim padding and reject truncated payloads.
     pub total_samples_per_channel: Option<u64>,
 }
 
@@ -82,9 +101,12 @@ pub trait DsdStream {
 /// `Unsupported` (e.g. DFF/DST), which is a normal analysis result, not a failure.
 #[derive(Debug)]
 pub enum DsdError {
+    Invalid(String),
     Io(std::io::Error),
     /// A chunk magic did not match what the format requires.
-    BadMagic { want: &'static str },
+    BadMagic {
+        want: &'static str,
+    },
     /// The file ended before a required field/chunk was fully read.
     Truncated,
     /// Structurally valid but unsupported (non-1-bit, unknown format id, …).
@@ -94,6 +116,7 @@ pub enum DsdError {
 impl fmt::Display for DsdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            DsdError::Invalid(why) => write!(f, "invalid input: {why}"),
             DsdError::Io(e) => write!(f, "I/O error: {e}"),
             DsdError::BadMagic { want } => write!(f, "bad chunk magic (expected {want:?})"),
             DsdError::Truncated => write!(f, "file truncated"),
