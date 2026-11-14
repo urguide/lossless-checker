@@ -58,7 +58,7 @@ Two deliberate design points:
 
 ## Install
 
-Grab a prebuilt binary from the [latest release](https://github.com/NaughtyDogOfSchrodinger/lossless-checker/releases/latest) — no toolchain required. Pick the asset for your platform:
+Grab a prebuilt binary from the [latest release](https://github.com/urguide/lossless-checker/releases/latest) — no toolchain required. Pick the asset for your platform:
 
 | Platform                 | Asset                                                  |
 |--------------------------|--------------------------------------------------------|
@@ -109,7 +109,12 @@ Every branch push and pull request runs formatting, Clippy, unit tests, generate
 regressions and an OSV check of all locked dependencies. Successful runs build Linux GNU/musl,
 macOS Intel/Apple Silicon and Windows x64 packages. Download archives and SHA-256 files from
 **Actions → Test, build and package → Artifacts** (retained for 14 days).
-Pushing a `v*` tag additionally publishes those packages as a GitHub Release with build provenance.
+Every push to `master` automatically publishes a GitHub Release with build provenance after all
+checks and platform builds pass. Its tag is `build-<12-character commit SHA>` and points to the
+exact source commit. Re-running the same commit updates the same release. You can also select
+**Run workflow → master** in Actions to publish manually. Pushing a `v*` tag publishes a release
+under that version tag instead. Each published release becomes the latest download; other branches
+and pull requests only upload Actions artifacts.
 Verify an archive with `gh attestation verify <archive> --repo <owner>/<repo>`; a checksum alone
 does not authenticate its publisher. Actions are pinned to commit SHAs and Rust to 1.100.0.
 

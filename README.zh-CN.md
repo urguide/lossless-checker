@@ -49,7 +49,7 @@ dB）让差距一目了然：真 Hi-Res 约在 −30 dB，上采样会跌到 −
 
 ## 安装
 
-从[最新发布](https://github.com/NaughtyDogOfSchrodinger/lossless-checker/releases/latest)下载预编译的二进制即可，无需安装工具链。按平台选择对应文件：
+从[最新发布](https://github.com/urguide/lossless-checker/releases/latest)下载预编译的二进制即可，无需安装工具链。按平台选择对应文件：
 
 | 平台                     | 文件                                                   |
 |--------------------------|--------------------------------------------------------|
@@ -98,7 +98,10 @@ cargo build --locked --release
 每次 branch push 或 pull request 都會執行格式、Clippy、單元測試、安全回歸測試與 OSV 依賴檢查，
 通過後編譯 Linux GNU/musl、macOS Intel/Apple Silicon、Windows x64。
 到 **Actions → Test, build and package → Artifacts** 下載壓縮包與 SHA-256，保留 14 天。
-推送 `v*` tag 時另外建立 Release 與建置來源證明，可用
+每次推送 `master`，所有檢查及平台編譯通過後會自動建立 Release 與建置來源證明。
+自動 tag 為 `build-<commit 前 12 碼>`，指向實際建置的 commit；同一 commit 重跑會更新同一個 Release。
+也可在 Actions 選擇 **Run workflow → master** 手動發布；推送 `v*` tag 則使用該版本 tag 發布。
+每次發布都會設為最新下載版本；其他分支與 pull request 僅上傳 Actions artifacts。可用
 `gh attestation verify <壓縮包> --repo <owner>/<repo>` 驗證；雜湊本身不代表發佈者身分驗證。
 
 - 輸出路徑必須尚不存在，重跑請換檔名；不允許覆寫音訊、既有報告或連結目標。
